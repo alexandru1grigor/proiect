@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a reproducible problem in the News app.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to report a bug.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the exact steps needed to reproduce the issue.
+      placeholder: |
+        1. Go to /stories/top...
+        2. Click...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Local
+        - Ephemeral PR environment
+        - UAT
+        - Production
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Story list (a feed)
+        - Story details / comments
+        - Navigation
+        - Simulate load
+        - Logging / metrics
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: visitor
+    attributes:
+      label: Visitor id
+      description: >-
+        Optional, but it makes the report searchable in the logs. Hover the
+        "Anonymous visitor" chip in the header, or read the `news_vid` cookie.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, console errors, or screenshots
+      description: Add relevant logs, screenshots, or screen recordings.
+      render: text

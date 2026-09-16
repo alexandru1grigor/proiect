@@ -1,0 +1,596 @@
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+    paths-ignore:
+      - "chart/**"
+      - ".github/**"
+      - "*.md"
+      - "docs/**"
+
+  release:
+    types: [published]
+
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Skip image build validation and only tag/deploy"
+        type: boolean
+        default: false
+      force_version:
+        description: "Force specific version, without v prefix. Leave empty for auto-increment"
+        required: false
+        type: string
+      deploy_prod:
+        description: "Also promote this version to production (requires production environment approval)"
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  APP_NAME: news
+  APP_PORT: "3000"
+  REQUIRED_RUNTIME_ENVS: NEWS_API_URL
+  OPTIONAL_RUNTIME_ENVS: ""
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Calculate Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_release: ${{ steps.version.outputs.is_release }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest SemVer tag
+        id: get_tag
+        run: |
+          LATEST_TAG=$(git describe --tags --match "[0-9]*.[0-9]*.[0-9]*" --abbrev=0 2>/dev/null || echo "0.0.0")
+          echo "latest_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Latest tag: ${LATEST_TAG}"
+
+      - name: Calculate next version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_VERSION: ${{ github.event.inputs.force_version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ -n "$FORCE_VERSION" ]; then
+            NEW_VERSION="${FORCE_VERSION#v}"
+
+            if ! echo "$NEW_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::force_version must look like 1.2.3"
+              exit 1
+            fi
+
+            IS_RELEASE="false"
+            if [ "$EVENT_NAME" = "release" ]; then
+              IS_RELEASE="true"
+            fi
+
+            echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "is_release=${IS_RELEASE}" >> "$GITHUB_OUTPUT"
+            echo "Forced version: ${NEW_VERSION}"
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" = "release" ]; then
+            NEW_VERSION="${RELEASE_TAG#v}"
+
+            if ! echo "$NEW_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Release tag must look like 1.2.3"
+              exit 1
+            fi
+
+            echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "Release version: ${NEW_VERSION}"
+            exit 0
+          fi
+
+          LATEST_TAG="${{ steps.get_tag.outputs.latest_tag }}"
+          VERSION="${LATEST_TAG#v}"
+
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Latest tag is not a valid SemVer tag: ${LATEST_TAG}"
+            exit 1
+          fi
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+
+          MAJOR=${MAJOR:-0}
+          MINOR=${MINOR:-0}
+          PATCH=${PATCH:-0}
+
+          COMMIT_MSG="$(git log -1 --pretty=%B)"
+
+          if echo "$COMMIT_MSG" | grep -Eq '^feat(\(.+\))?!?:'; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+
+          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_release=false" >> "$GITHUB_OUTPUT"
+          echo "New version: ${NEW_VERSION}"
+
+  build:
+    name: Build Image
+    runs-on: ubuntu-latest
+    needs: version
+    if: github.event_name != 'release' && github.event.inputs.skip_tests != 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Normalize image name
+        id: image
+        run: |
+          IMAGE="$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.image.outputs.image }}:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test image
+        run: |
+          docker run --rm "${{ steps.image.outputs.image }}:test" node --version || true
+          echo "Image built successfully"
+
+  push:
+    name: Push to Registry
+    runs-on: ubuntu-latest
+    needs: [version, build]
+    if: |
+      always() &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Normalize image name
+        id: image
+        run: |
+          IMAGE="$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.version.outputs.version }},enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'release' }}
+            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/main' }}
+            type=ref,event=tag
+            type=sha,prefix=sha-
+          labels: |
+            org.opencontainers.image.title=${{ env.APP_NAME }}
+            org.opencontainers.image.description=News — Hacker News reader built with Next.js
+            ro.mtd.runtime-env.required=${{ env.REQUIRED_RUNTIME_ENVS }}
+            ro.mtd.runtime-env.optional=${{ env.OPTIONAL_RUNTIME_ENVS }}
+            ro.mtd.app.port=${{ env.APP_PORT }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  tag:
+    name: Create Git Tag and Release
+    runs-on: ubuntu-latest
+    needs: [version, push]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        env:
+          RELEASE_BOT_NAME: ${{ vars.RELEASE_BOT_NAME }}
+          RELEASE_BOT_EMAIL: ${{ vars.RELEASE_BOT_EMAIL }}
+        run: |
+          git config user.name "${RELEASE_BOT_NAME:-github-actions[bot]}"
+          git config user.email "${RELEASE_BOT_EMAIL:-github-actions[bot]@users.noreply.github.com}"
+
+      - name: Verify token permissions
+        env:
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "Running as ${ACTOR}. Push access is enforced by the job's 'contents: write' permission; later git/gh steps will fail loudly if it's missing."
+
+      - name: Update changelog for release
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          PREVIOUS_TAG=$(git describe --tags --match "[0-9]*.[0-9]*.[0-9]*" --abbrev=0 2>/dev/null || true)
+          RELEASE_DATE=$(date -u +%F)
+          export PREVIOUS_TAG RELEASE_DATE
+
+          ruby <<'RUBY'
+          path = "CHANGELOG.md"
+          version = ENV.fetch("VERSION")
+          tag = version
+          previous_tag = ENV.fetch("PREVIOUS_TAG", "")
+          release_date = ENV.fetch("RELEASE_DATE")
+          base_url = "https://github.com/#{ENV.fetch("GITHUB_REPOSITORY")}"
+          text = File.read(path)
+
+          unless text.match?(/^## \[Unreleased\]$/)
+            warn "CHANGELOG.md must contain a top-level ## [Unreleased] section."
+            exit 1
+          end
+
+          release_heading = "## [#{version}] - #{release_date}"
+          replacement = [
+            "## [Unreleased]", "", "### Added", "", "### Changed", "",
+            "### Fixed", "", "---", "", release_heading
+          ].join("\n")
+          text.sub!(/^## \[Unreleased\]$/, replacement)
+
+          unreleased_link = "[Unreleased]: #{base_url}/compare/#{tag}...HEAD"
+          if text.match?(/^\[Unreleased\]: .+$/)
+            text.sub!(/^\[Unreleased\]: .+$/, unreleased_link)
+          else
+            text << "\n#{unreleased_link}\n"
+          end
+
+          release_link = if previous_tag.empty?
+                           "[#{version}]: #{base_url}/releases/tag/#{tag}"
+                         else
+                           "[#{version}]: #{base_url}/compare/#{previous_tag}...#{tag}"
+                         end
+
+          if text.match?(/^\[[0-9]+\.[0-9]+\.[0-9]+\]: /)
+            text.sub!(/^(\[[0-9]+\.[0-9]+\.[0-9]+\]: .+)$/, "#{release_link}\n\\1")
+          else
+            text << "#{release_link}\n"
+          end
+
+          File.write(path, text)
+          RUBY
+
+      - name: Commit changelog
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          git add CHANGELOG.md
+          git diff --staged --quiet || git commit -m "chore(release): ${VERSION} [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Write release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ruby <<'RUBY'
+          version = ENV.fetch("VERSION")
+          text = File.read("CHANGELOG.md")
+          pattern = /^## \[#{Regexp.escape(version)}\] - [^\n]+\n(?<body>.*?)(?:\n---\n|\n\[[^\n]+\]: )/m
+          notes = text.match(pattern)&.named_captures&.fetch("body", nil)&.strip
+          notes = "Release #{version}" if notes.nil? || notes.empty?
+          File.write(File.join(ENV.fetch("RUNNER_TEMP"), "release-notes.md"), "#{notes}\n")
+          RUBY
+
+      - name: Create and push tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if git ls-remote --tags origin | grep -q "refs/tags/${VERSION}$"; then
+            echo "Tag ${VERSION} already exists remotely. Deleting and recreating..."
+            git push origin --delete "${VERSION}" || true
+          fi
+
+          git tag -d "${VERSION}" 2>/dev/null || true
+          git tag -a "${VERSION}" -m "Release ${VERSION}"
+          git push origin "${VERSION}"
+
+          echo "Created tag: ${VERSION}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            echo "GitHub Release ${VERSION} already exists. Deleting and recreating..."
+            gh release delete "${VERSION}" --yes --cleanup-tag=false
+          fi
+
+          gh release create "${VERSION}" \
+            --title "${VERSION}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+
+          echo "Created GitHub Release: ${VERSION}"
+
+  check-prod-label:
+    name: Check Deploy-to-Prod Signal
+    runs-on: ubuntu-latest
+    needs: version
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    outputs:
+      deploy_prod: ${{ steps.check.outputs.deploy_prod }}
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Determine deploy-to-prod signal
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_INPUT: ${{ github.event.inputs.deploy_prod }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "deploy_prod=${DISPATCH_INPUT:-false}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A push to main is normally a merged PR. Find it and look for the
+          # `deploy:prod` label — that's the signal to also promote to production.
+          LABELS="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '.[].labels[].name' 2>/dev/null || true)"
+
+          if echo "$LABELS" | grep -qx "deploy:prod"; then
+            echo "deploy_prod=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy_prod=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  update-helm:
+    name: Update Helm Values
+    runs-on: ubuntu-latest
+    needs: [version, push, tag]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        env:
+          RELEASE_BOT_NAME: ${{ vars.RELEASE_BOT_NAME }}
+          RELEASE_BOT_EMAIL: ${{ vars.RELEASE_BOT_EMAIL }}
+        run: |
+          git config user.name "${RELEASE_BOT_NAME:-github-actions[bot]}"
+          git config user.email "${RELEASE_BOT_EMAIL:-github-actions[bot]@users.noreply.github.com}"
+
+      - name: Update image tag in values-dev.yaml
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+
+          git pull --rebase origin main
+
+          VALUES_FILE="chart/values-dev.yaml"
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "::error::Helm values file not found: ${VALUES_FILE}"
+            exit 1
+          fi
+
+          if ! grep -q '^  tag: ' "$VALUES_FILE"; then
+            echo "::error::No image tag field found in ${VALUES_FILE}. Expected a line like:   tag: \"1.2.3\""
+            exit 1
+          fi
+
+          sed -i "0,/^  tag: .*/s|^  tag: .*|  tag: \"${VERSION}\"|" "$VALUES_FILE"
+
+          echo "Updated image tag to ${VERSION} in ${VALUES_FILE}"
+
+      - name: Commit and push changes
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+
+          git add chart/values-dev.yaml
+
+          git diff --staged --quiet || git commit -m "chore($APP_NAME): update image tag to ${VERSION}"
+
+          git push origin main
+
+          echo "Pushed updated chart/values-dev.yaml"
+
+  update-helm-prod:
+    name: Promote to Production
+    runs-on: ubuntu-latest
+    needs: [version, push, tag, update-helm, check-prod-label]
+    if: |
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      needs.check-prod-label.outputs.deploy_prod == 'true'
+    environment: prod
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        env:
+          RELEASE_BOT_NAME: ${{ vars.RELEASE_BOT_NAME }}
+          RELEASE_BOT_EMAIL: ${{ vars.RELEASE_BOT_EMAIL }}
+        run: |
+          git config user.name "${RELEASE_BOT_NAME:-github-actions[bot]}"
+          git config user.email "${RELEASE_BOT_EMAIL:-github-actions[bot]@users.noreply.github.com}"
+
+      - name: Create promotion branch
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          git checkout -b "promote-prod/${VERSION}"
+
+      - name: Update image tag in values-prod.yaml
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+
+          VALUES_FILE="chart/values-prod.yaml"
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "::error::Helm values file not found: ${VALUES_FILE}"
+            exit 1
+          fi
+
+          if ! grep -q '^  tag: ' "$VALUES_FILE"; then
+            echo "::error::No image tag field found in ${VALUES_FILE}. Expected a line like:   tag: \"1.2.3\""
+            exit 1
+          fi
+
+          sed -i "0,/^  tag: .*/s|^  tag: .*|  tag: \"${VERSION}\"|" "$VALUES_FILE"
+
+          echo "Updated image tag to ${VERSION} in ${VALUES_FILE}"
+
+      - name: Push promotion branch
+        id: push_branch
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+
+          git add chart/values-prod.yaml
+
+          if git diff --staged --quiet; then
+            echo "chart/values-prod.yaml is already at ${VERSION}, nothing to promote."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "chore($APP_NAME): promote ${VERSION} to production"
+          git push origin "promote-prod/${VERSION}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open promotion PR
+        if: steps.push_branch.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+
+          gh pr create \
+            --base main \
+            --head "promote-prod/${VERSION}" \
+            --title "chore(prod): promote ${VERSION} to production" \
+            --body "Promotes \`${VERSION}\` to production by bumping the image tag in \`chart/values-prod.yaml\`. Triggered by the \`deploy:prod\` label. Nothing deploys until this is reviewed and merged." \
+            --reviewer DanielMandea
+
+          echo "Opened promotion PR for ${VERSION}"
+
+  update-helm-release:
+    name: Update Helm Values Release
+    runs-on: ubuntu-latest
+    needs: [version, push]
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        env:
+          RELEASE_BOT_NAME: ${{ vars.RELEASE_BOT_NAME }}
+          RELEASE_BOT_EMAIL: ${{ vars.RELEASE_BOT_EMAIL }}
+        run: |
+          git config user.name "${RELEASE_BOT_NAME:-github-actions[bot]}"
+          git config user.email "${RELEASE_BOT_EMAIL:-github-actions[bot]@users.noreply.github.com}"
+
+      - name: Update image tag in values-dev.yaml
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+
+          git pull --rebase origin main
+
+          VALUES_FILE="chart/values-dev.yaml"
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "::error::Helm values file not found: ${VALUES_FILE}"
+            exit 1
+          fi
+
+          if ! grep -q '^  tag: ' "$VALUES_FILE"; then
+            echo "::error::No image tag field found in ${VALUES_FILE}. Expected a line like:   tag: \"1.2.3\""
+            exit 1
+          fi
+
+          sed -i "0,/^  tag: .*/s|^  tag: .*|  tag: \"${VERSION}\"|" "$VALUES_FILE"
+
+          echo "Updated image tag to ${VERSION} in ${VALUES_FILE}"
+
+      - name: Commit and push changes
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+
+          git add chart/values-dev.yaml
+
+          git diff --staged --quiet || git commit -m "chore($APP_NAME): update image tag to ${VERSION} (release)"
+
+          git push origin main
+
+          echo "Pushed updated chart/values-dev.yaml"
