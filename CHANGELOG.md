@@ -14,6 +14,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.0.1] - 2026-09-16
+
+### Added
+
+### Changed
+
+### Fixed
+
+---
+
 ## [0.2.0] - 2026-09-16
 
 ### Added
@@ -48,6 +58,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-[Unreleased]: https://github.com/mtdtechnology-net/learning-news/compare/0.2.0...HEAD
+[Unreleased]: https://github.com/mtdtechnology-net/learning-news/compare/0.0.1...HEAD
+[0.0.1]: https://github.com/mtdtechnology-net/learning-news/releases/tag/0.0.1
 [0.2.0]: https://github.com/mtdtechnology-net/learning-news/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/mtdtechnology-net/learning-news/releases/tag/0.1.0
