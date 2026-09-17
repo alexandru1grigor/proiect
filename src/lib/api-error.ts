@@ -11,3 +11,4 @@ export const getApiErrorMessage = (error: unknown, fallback = 'Something went wr
   if (Array.isArray(message)) return message.join('. ')
   return typeof message === 'string' ? message : fallback
 }
+//
