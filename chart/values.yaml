@@ -1,0 +1,30 @@
+replicaCount: 1
+image:
+  repository: ghcr.io/alexandru1grigor/proiect
+  pullPolicy: IfNotPresent
+  tag: "latest"
+imagePullSecrets:
+  - name: ghcr-pull-secret
+nameOverride: ""
+fullnameOverride: ""
+service:
+  type: ClusterIP
+  port: 3000
+healthCheck:
+  path: /api/health
+env:
+  NODE_ENV: production
+  PORT: "3000"
+  HOSTNAME: "0.0.0.0"
+  NEWS_API_URL: "https://hacker-news.firebaseio.com/v0"
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+route:
+  enabled: true
+monitoring:
+  enabled: true
