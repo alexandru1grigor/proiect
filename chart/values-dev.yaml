@@ -1,4 +1,4 @@
 image:
-  tag: "0.1.0"
+  tag: "0.0.1"
 env:
   NEWS_API_URL: "https://hacker-news.firebaseio.com/v0"
